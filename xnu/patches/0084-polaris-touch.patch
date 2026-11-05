@@ -1,0 +1,618 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/polaris_touch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void polaris_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,8 @@
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	/* POLARIS (Mi MIX 2S): Synaptics S3330 on QUPv3_1 SE 0xa98000. */
++	polaris_touch_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/polaris_touch.c
+@@ -0,0 +1,586 @@
++/*
++ * POLARIS (Mi MIX 2S, SDM845) Synaptics S3330 TDDI (in-cell) touch bring-up.
++ *
++ * One kernel thread, polled. No interrupts, no PMIC writes, no firmware
++ * upload.  Hardware facts are from the stock device tree (dtb_36, the retail
++ * "Xiaomi Technologies, Inc. Polaris MP v2.1" tree extracted from boot.img):
++ *
++ *   /soc/i2c@a98000/synaptics_dsi_i2c@20   compatible "synaptics,dsx-i2c-force"
++ *       reg 0x20 (7-bit); synaptics,ub-i2c-addr 0x2c
++ *       synaptics,cfg_1/synaptics,chip-id-name = "S3330"; panel-is-incell
++ *       interrupt-parent /soc/pinctrl@03400000, interrupts <125 0x2008>
++ *       synaptics,reset-gpio    = <TLMM 99 0>     (active low)
++ *       synaptics,drm-dsi-reset = <TLMM 6 0>      (display reset: not touched)
++ *       vdd  = /soc/tp_vddio_vreg  regulator-fixed, gpio <TLMM 23 0>,
++ *              enable-active-high, startup-delay-us 4000, regulator-boot-on
++ *       disp = pm8998_l14 (RPMh ldoa14, 1.8 V); avdd = pm8998_l28 (RPMh ldoa28)
++ *       lab/ibb = PMI8998 qpnp-labibb (panel rails; ABL's splash keeps them on)
++ *       power-delay 5 ms, reset-active 5 ms, reset-delay 200 ms
++ *
++ * The GENI I2C core (register map, FIFO message protocol, packing) is the same
++ * silicon the SWEET driver already drives at 0xa84000; polaris puts touch on
++ * the QUPv3_1 SE at 0xa98000 (wrapper 0xa80000, SE index 6 => global SE14) and
++ * the TLMM at 0x03400000 instead of 0x03900000.
++ *
++ * Protocol: RMI4 over I2C (two-byte address = page << 8 | register).  The page
++ * descriptor table is scanned for F01 (device control: enable reporting) and
++ * F12 (2D sensor: read reports).  Raw reports are logged so the first
++ * on-device boot shows whether the coordinate layout matches the heuristic.
++ *
++ * Boot-arg: polaristouch=1 (optional polaristouchdelay=<seconds>).  The polaris
++ * command line already passes sweettouch=0 sweetkeys=0, so the SWEET
++ * Goodix/Focaltech driver stays out of the way.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void polaris_touch_init(void);
++
++/* ---- polaris physical addresses (stock DTB) ---- */
++#define POL_SE_PA        0x00a98000u      /* i2c@a98000  (QUPv3_1 SE6) */
++#define POL_GCC_PA       0x00100000u
++#define POL_TLMM_PA      0x03400000u      /* pinctrl@03400000 */
++#define POL_GPIO_RESET   99u
++#define POL_GPIO_IRQ     125u
++#define POL_GPIO_VDDIO   23u
++
++/* ---- GENI SE window (same layout as the SWEET driver) ---- */
++#define SE_STATUS   0x040u
++#define SE_MCLK     0x048u
++#define SE_FW       0x068u
++#define SE_CLK_SEL  0x07cu
++#define SE_DMA      0x258u
++#define SE_TX_LEN   0x26cu
++#define SE_RX_LEN   0x270u
++#define SE_SCL      0x278u
++#define SE_CMD      0x600u
++#define SE_CTRL     0x604u
++#define SE_IRQ      0x610u
++#define SE_IRQ_CLR  0x618u
++#define SE_TX       0x700u
++#define SE_RX       0x780u
++#define SE_TX_COUNT 0x800u
++#define SE_RX_COUNT 0x804u
++#define SE_HW_TX    0xe24u
++#define SE_HW_RX    0xe28u
++#define SE_TX_WM    0x80cu
++/* M and S packing registers (geni_se_config_packing(8, 4, true, true, true)) */
++#define SE_M_PACK0  0x260u
++#define SE_M_PACK1  0x264u
++#define SE_S_PACK0  0x284u
++#define SE_S_PACK1  0x288u
++
++#define SE_RX_WM_IRQ (1u << 26)
++#define SE_RX_LAST   (1u << 27)
++#define SE_TX_WM_IRQ (1u << 30)
++#define SE_DONE      (1u << 0)
++#define SE_NACK      (1u << 10)
++#define SE_ERRORS    (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++                      (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_PACK0     0x0007f8feu
++#define SE_PACK1     0x000ffefeu
++
++#define POL_TOUCH_MAX   10u
++#define POL_F12_FINGERS 3u      /* how many F12 records we read per poll */
++#define POL_X_MAX       1080
++#define POL_Y_MAX       2160
++
++/* RMI4 */
++#define RMI_PDT_SCAN_START 0x00e9u
++#define RMI_PDT_ENTRY_SIZE 6u
++#define RMI_ADDR           0x20u
++#define RMI_ADDR_UB        0x2cu
++#define RMI_F01            0x01u
++#define RMI_F12            0x12u
++
++static struct {
++	vm_offset_t se, gcc, tlmm;
++	bool started, dead, probing, have_f01, have_f12;
++	uint8_t f01_query, f01_ctrl;
++	uint8_t f12_query, f12_ctrl, f12_data;
++	uint32_t irq_status, irq_last;
++	unsigned sent, got;
++	uint32_t reports, errors;
++	int x[POL_TOUCH_MAX], y[POL_TOUCH_MAX];
++	int down[POL_TOUCH_MAX];
++} pt;
++static int pol_sleep_chan;
++
++static uint32_t
++pol_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pol_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++pol_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&pol_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++pol_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(pol_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* ---- TLMM: cfg at n*0x1000 (mux<<2 | pull | drive<<6 | OE 0x200), IO at +4 ---- */
++static void
++pol_gpio(uint32_t pin, uint32_t mux, uint32_t pull, uint32_t drive,
++    bool out, bool high)
++{
++	uint32_t cfg_off = pin * 0x1000u;
++	uint32_t io_off = cfg_off + 4u;
++	uint32_t cfg = pol_rd(pt.tlmm, cfg_off);
++
++	if (out) {
++		uint32_t io = pol_rd(pt.tlmm, io_off) & ~2u;
++		pol_wr(pt.tlmm, io_off, io | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	pol_wr(pt.tlmm, cfg_off, cfg);
++}
++
++static bool
++pol_gpio_in(uint32_t pin)
++{
++	return (pol_rd(pt.tlmm, pin * 0x1000u + 4u) & 1u) != 0;
++}
++
++/* ---- GENI I2C ---- */
++
++static uint32_t
++pol_irq(void)
++{
++	pt.irq_last = pol_rd(pt.se, SE_IRQ);
++	pt.irq_status |= pt.irq_last;
++	return pt.irq_last;
++}
++
++/* One Linux-style FIFO message: TX up to 3 bytes, RX up to 90. */
++static int
++pol_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	if (pt.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	if (!pol_wait_clear(pt.se, SE_STATUS, 1u)) {
++		pt.dead = true;
++		return EBUSY;
++	}
++	pol_wr(pt.se, SE_IRQ_CLR, 0xffffffffu);
++	pol_wr(pt.se, SE_TX_WM, nt ? 1u : 0u);
++	pol_wr(pt.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	pol_wr(pt.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
++	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = pol_irq();
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			/* A completed NACK is normal while probing addresses. */
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = pol_irq();
++			}
++			if ((irq & SE_DONE) && !(pol_rd(pt.se, SE_STATUS) & 1u) &&
++			    !(pol_rd(pt.se, SE_TX_COUNT) & 0xfffffffu) &&
++			    !(pol_rd(pt.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				pol_wr(pt.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !pt.sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			pol_wr(pt.se, SE_TX, word);
++			pt.sent = nt;
++			pol_wr(pt.se, SE_TX_WM, 0);
++		}
++		uint32_t count = pol_rd(pt.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 64 || count > (nr - pt.got + 3u) / 4u) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = pol_rd(pt.se, SE_RX);
++			for (unsigned j = 0; j < 4 && pt.got < nr; ++j) {
++				rx[pt.got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		/* Drain RX before trusting DONE so a final short word is not lost. */
++		if (irq & SE_DONE) {
++			irq = pol_irq();
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			pol_wr(pt.se, SE_IRQ_CLR, irq);
++			if (pt.got == nr && pt.sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		pol_wr(pt.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	/* Abort an in-flight transfer and leave the engine idle. */
++	pol_wr(pt.se, SE_CTRL, 2);
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (pol_rd(pt.se, SE_IRQ) & (1u << 5)) {
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (pol_rd(pt.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)pol_rd(pt.se, SE_RX);
++	}
++	pol_wr(pt.se, SE_IRQ_CLR, 0xffffffffu);
++	return err;
++}
++
++static int
++pol_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
++    unsigned nr, bool stretch)
++{
++	pt.irq_status = pt.irq_last = 0;
++	pt.sent = pt.got = 0;
++	int err = pol_msg_run(addr, tx, nt, rx, nr, stretch);
++	if (pt.probing) {
++		printf("POLARIS TOUCH: probe addr=%#x %s len=%u stretch=%u err=%d "
++		    "irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
++		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
++		    err, pt.irq_last, pt.irq_status, pt.sent, pt.got,
++		    pol_rd(pt.se, SE_STATUS));
++	}
++	return err;
++}
++
++/* RMI4: two-byte address written with STOP_STRETCH, then a repeated-start read. */
++static int
++rmi_read(uint8_t addr, uint16_t reg, uint8_t *buf, unsigned len)
++{
++	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)(reg & 0xffu)};
++	int err = pol_msg(addr, ptr, 2, NULL, 0, true);
++	if (err) {
++		return err;
++	}
++	return pol_msg(addr, NULL, 0, buf, len, false);
++}
++
++static int
++rmi_write(uint8_t addr, uint16_t reg, uint8_t val)
++{
++	uint8_t buf[3] = {(uint8_t)(reg >> 8), (uint8_t)(reg & 0xffu), val};
++	return pol_msg(addr, buf, 3, NULL, 0, false);
++}
++
++/* ---- GENI I2C initialisation (as verified for SWEET's SE7) ---- */
++static bool
++pol_se_init(void)
++{
++	printf("POLARIS TOUCH: SE fw=%#x hw_tx=%#x hw_rx=%#x\n",
++	    pol_rd(pt.se, SE_FW), pol_rd(pt.se, SE_HW_TX), pol_rd(pt.se, SE_HW_RX));
++
++	pol_wr(pt.se, SE_DMA, 0);
++	pol_wr(pt.se, SE_CLK_SEL, 0);
++	pol_wr(pt.se, SE_MCLK, (7u << 4) | 1u);
++	pol_wr(pt.se, SE_SCL, (10u << 20) | (11u << 10) | 26u);   /* 100 kHz */
++	pol_wr(pt.se, SE_M_PACK0, SE_PACK0);
++	pol_wr(pt.se, SE_M_PACK1, SE_PACK1);
++	pol_wr(pt.se, SE_S_PACK0, SE_PACK0);
++	pol_wr(pt.se, SE_S_PACK1, SE_PACK1);
++
++	bool ok = pol_rd(pt.se, SE_M_PACK0) == SE_PACK0 &&
++	    pol_rd(pt.se, SE_M_PACK1) == SE_PACK1 &&
++	    pol_rd(pt.se, SE_S_PACK0) == SE_PACK0 &&
++	    pol_rd(pt.se, SE_S_PACK1) == SE_PACK1;
++	printf("POLARIS TOUCH: packing %s (m=%#x/%#x s=%#x/%#x)\n",
++	    ok ? "ok" : "MISMATCH",
++	    pol_rd(pt.se, SE_M_PACK0), pol_rd(pt.se, SE_M_PACK1),
++	    pol_rd(pt.se, SE_S_PACK0), pol_rd(pt.se, SE_S_PACK1));
++	return ok;
++}
++
++static void
++pol_clocks(void)
++{
++	/* Diagnostics only: if ABL left the QUPv3_1 branch configured we keep it.
++	 * The log tells us which RCG branch to vote if transfers fail. */
++	printf("POLARIS TOUCH: gcc qupv3 vote=%#x\n", pol_rd(pt.gcc, 0x5200cu));
++	const uint32_t cand[] = {0x18150, 0x18154, 0x18158, 0x1815c,
++	                         0x18160, 0x18164, 0x18168, 0x1816c};
++	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); ++i) {
++		uint32_t v = pol_rd(pt.gcc, cand[i]);
++		if (v && !(v & 1u)) {
++			printf("POLARIS TOUCH: rcg %#x = %#x\n", cand[i], v);
++		}
++	}
++}
++
++/* ---- Synaptics power-up and RMI4 ---- */
++
++static void
++pol_power_on(void)
++{
++	/* tp_vddio_vreg: GPIO 23 active high, 4 ms startup delay. */
++	pol_gpio(POL_GPIO_VDDIO, 0, 0, 3, true, true);
++	pol_wait(10);
++	/* reset, active low: 5 ms asserted, then 200 ms settling */
++	pol_gpio(POL_GPIO_RESET, 0, 0, 3, true, false);
++	pol_wait(5);
++	pol_gpio(POL_GPIO_RESET, 0, 0, 3, true, true);
++	pol_wait(200);
++}
++
++static void
++pol_pdt_scan(void)
++{
++	unsigned entries = 0;
++	for (uint16_t reg = RMI_PDT_SCAN_START; reg >= 0x000bu; reg -= RMI_PDT_ENTRY_SIZE) {
++		uint8_t e[RMI_PDT_ENTRY_SIZE];
++		if (rmi_read(RMI_ADDR, reg, e, sizeof(e))) {
++			break;
++		}
++		if (e[0] == 0x00) {
++			break;                       /* end of table */
++		}
++		entries++;
++		printf("POLARIS TOUCH: PDT F%02x query=%#x cmd=%#x ctrl=%#x "
++		    "data=%#x irq=%#x\n", e[0], e[1], e[2], e[3], e[4], e[5]);
++		if (e[0] == RMI_F01) {
++			pt.f01_query = e[1];
++			pt.f01_ctrl = e[3];
++			pt.have_f01 = true;
++		} else if (e[0] == RMI_F12) {
++			pt.f12_query = e[1];
++			pt.f12_ctrl = e[3];
++			pt.f12_data = e[4];
++			pt.have_f12 = true;
++		}
++	}
++	printf("POLARIS TOUCH: PDT entries=%u f01=%d f12=%d\n",
++	    entries, pt.have_f01, pt.have_f12);
++}
++
++static void
++pol_f01_enable(void)
++{
++	uint8_t q[8];
++
++	if (!rmi_read(RMI_ADDR, pt.f01_query, q, sizeof(q))) {
++		printf("POLARIS TOUCH: F01 query mfg=%#x props=%#x fw=%#x "
++		    "status=%#x ctrl=%#x\n", q[0], q[1], q[2], q[3], q[4]);
++	}
++	if (!rmi_read(RMI_ADDR, pt.f01_ctrl, q, 3)) {
++		printf("POLARIS TOUCH: F01 ctrl before %#x %#x %#x\n",
++		    q[0], q[1], q[2]);
++		/* Device control: normal operation (clear sleep/idle bits). */
++		(void)rmi_write(RMI_ADDR, pt.f01_ctrl,
++		    (uint8_t)(q[0] & ~((1u << 0) | (1u << 1) | (1u << 2))));
++		/* Interrupt enable: touch reporting on. */
++		(void)rmi_write(RMI_ADDR, pt.f01_ctrl + 1, (uint8_t)(q[1] | 1u));
++		if (!rmi_read(RMI_ADDR, pt.f01_ctrl, q, 2)) {
++			printf("POLARIS TOUCH: F01 ctrl after %#x %#x\n", q[0], q[1]);
++		}
++	}
++}
++
++static void
++pol_f12_query_log(void)
++{
++	uint8_t q[16];
++	if (!rmi_read(RMI_ADDR, pt.f12_query, q, sizeof(q))) {
++		printf("POLARIS TOUCH: F12 query %#x %#x %#x %#x %#x %#x %#x %#x\n",
++		    q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
++	}
++}
++
++static void
++pol_report(int finger, int on, int x, int y)
++{
++	if (on) {
++		pt.x[finger] = x;
++		pt.y[finger] = y;
++	}
++	sweet_hid_touch(finger, on, on ? x : pt.x[finger],
++	    on ? y : pt.y[finger]);
++}
++
++/*
++ * F12 report (RMI4 data1):
++ *   [0]           status: number of active objects in the low nibble
++ *   [1 + 6*i ..]  per finger: X lo, X hi, Y lo, Y hi, Z, W
++ * The 16-bit interpretation is used when it stays inside the panel; otherwise
++ * the 8-bit one is.  Raw bytes are logged, so a mismatch is visible on device.
++ */
++static int
++pol_f12_poll(void)
++{
++	uint8_t data[1 + 6 * POL_F12_FINGERS];
++	if (rmi_read(RMI_ADDR, pt.f12_data, data, sizeof(data))) {
++		return EIO;
++	}
++	unsigned touches = data[0] & 0x0fu;
++	pt.reports++;
++	/* Never index past the records we actually read. */
++	if (touches > POL_F12_FINGERS) {
++		touches = POL_F12_FINGERS;
++	}
++	if (pt.reports <= 5u || touches != 0u) {
++		printf("POLARIS TOUCH: F12 status=%#x n=%u raw=%02x %02x %02x %02x "
++		    "%02x %02x %02x %02x\n", data[0], touches, data[1], data[2],
++		    data[3], data[4], data[5], data[6], data[7], data[8]);
++	}
++	if (touches == 0u) {
++		for (unsigned f = 0; f < POL_TOUCH_MAX; ++f) {
++			if (pt.down[f]) {
++				pol_report((int)f, 0, 0, 0);
++				pt.down[f] = 0;
++			}
++		}
++		return 0;
++	}
++	for (unsigned f = 0; f < touches; ++f) {
++		unsigned o = 1u + 6u * f;
++		int x = (int)data[o] | ((int)data[o + 1] << 8);
++		int y = (int)data[o + 2] | ((int)data[o + 3] << 8);
++		if (x > POL_X_MAX || y > POL_Y_MAX) {
++			x = data[o];
++			y = data[o + 2];
++		}
++		if (x < 0) x = 0;
++		if (y < 0) y = 0;
++		if (x > POL_X_MAX) x = POL_X_MAX;
++		if (y > POL_Y_MAX) y = POL_Y_MAX;
++		if (!pt.down[f]) {
++			printf("POLARIS TOUCH: down f=%u x=%d y=%d\n", f, x, y);
++		}
++		pol_report((int)f, 1, x, y);
++		pt.down[f] = 1;
++	}
++	return 0;
++}
++
++static void
++pol_thread(void *arg, wait_result_t result)
++{
++	int delay_s = 0;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("polaristouchdelay", &delay_s, sizeof(delay_s));
++	if (delay_s > 0) {
++		pol_wait((unsigned)delay_s * 1000u);
++	}
++
++	pt.se = ml_io_map(POL_SE_PA, 0x4000u);
++	pt.gcc = ml_io_map(POL_GCC_PA, 0x100000u);
++	pt.tlmm = ml_io_map(POL_TLMM_PA, 0x100000u);
++	printf("POLARIS TOUCH: se=%#lx gcc=%#lx tlmm=%#lx\n",
++	    (unsigned long)pt.se, (unsigned long)pt.gcc, (unsigned long)pt.tlmm);
++
++	(void)pol_se_init();
++	pol_clocks();
++	pol_power_on();
++
++	pt.probing = true;
++	{
++		uint8_t q[8];
++		int err = rmi_read(RMI_ADDR, 0x0000u, q, sizeof(q));
++		printf("POLARIS TOUCH: probe %#x rc=%d bytes=%02x %02x %02x %02x\n",
++		    RMI_ADDR, err, q[0], q[1], q[2], q[3]);
++		err = rmi_read(RMI_ADDR_UB, 0x0000u, q, sizeof(q));
++		printf("POLARIS TOUCH: probe %#x rc=%d bytes=%02x %02x %02x %02x\n",
++		    RMI_ADDR_UB, err, q[0], q[1], q[2], q[3]);
++	}
++	pt.probing = false;
++
++	pol_pdt_scan();
++	if (!pt.have_f01 || !pt.have_f12) {
++		printf("POLARIS TOUCH: incomplete PDT (f01=%d f12=%d); stopping\n",
++		    pt.have_f01, pt.have_f12);
++		goto out;
++	}
++	pol_f01_enable();
++	pol_f12_query_log();
++
++	printf("POLARIS TOUCH: polling 60 Hz, irq gpio %u level=%d\n",
++	    POL_GPIO_IRQ, pol_gpio_in(POL_GPIO_IRQ) ? 1 : 0);
++	while (!pt.dead) {
++		int err = pol_f12_poll();
++		if (err) {
++			if ((pt.errors++ % 100u) == 0u) {
++				printf("POLARIS TOUCH: read err=%d irq=%#x\n",
++				    err, pt.irq_status);
++			}
++			if (pt.errors == 10u) {
++				pol_report(0, 0, 0, 0);
++			}
++		} else {
++			pt.errors = 0;
++		}
++		pol_wait(16);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++polaris_touch_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++
++	if (pt.started) {
++		return;
++	}
++	pt.started = true;
++	(void)PE_parse_boot_argn("polaristouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;                /* silent on SWEET hardware */
++	}
++	kern_return_t kr = kernel_thread_start(pol_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("POLARIS TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

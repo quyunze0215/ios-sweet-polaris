@@ -1,0 +1,72 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -299,6 +299,48 @@
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
++/*
++ * POLARIS dual-boot: expose only a window of the named partition as the root
++ * device, so the iOS root image can live in the tail of `userdata` while
++ * Android's f2fs keeps the front of it.  Boot args, in bytes:
++ *
++ *   ufsrootoff=<offset>   start of the window inside the partition (4 KiB aligned)
++ *   ufsrootsize=<size>    length of the window (default: to the partition end)
++ *
++ * Android's filesystem is shrunk below ufsrootoff first, so nothing outside the
++ * window is ever read or written; ufs_write_blocks() keeps its bounds checks
++ * against nblocks and therefore also cannot leave the window.
++ */
++static int
++ufs_apply_window(uint64_t off, uint64_t size)
++{
++	if (off % UFS_BLOCK) {
++		printf("SWEET UFS: ufsrootoff %llu is not %u-byte aligned\n",
++		    off, UFS_BLOCK);
++		return EINVAL;
++	}
++	uint64_t skip = off / UFS_BLOCK;
++	if (skip >= su.nblocks) {
++		printf("SWEET UFS: ufsrootoff %llu MiB beyond the %llu MiB partition\n",
++		    off >> 20, su.nblocks * UFS_BLOCK >> 20);
++		return EINVAL;
++	}
++	uint64_t total_blocks = su.nblocks;
++	uint64_t avail = total_blocks - skip;
++	uint64_t want = size ? (size + UFS_BLOCK - 1) / UFS_BLOCK : avail;
++	if (want == 0 || want > avail) {
++		printf("SWEET UFS: ufsrootsize %llu MiB does not fit in %llu MiB\n",
++		    size >> 20, avail * UFS_BLOCK >> 20);
++		return EINVAL;
++	}
++	su.first_block += skip;
++	su.nblocks = want;
++	printf("SWEET UFS: root window %llu MiB at +%llu MiB of a %llu MiB partition\n",
++	    want * UFS_BLOCK >> 20, off >> 20, total_blocks * UFS_BLOCK >> 20);
++	return 0;
++}
++
++
+ 
+ static int
+ ufs_find_partition(const char *want)
+@@ -600,6 +642,10 @@
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	/* POLARIS dual-boot window (see ufs_apply_window). */
++	uint64_t root_off = 0, root_size = 0;
++	PE_parse_boot_argn("ufsrootoff", &root_off, sizeof(root_off));
++	PE_parse_boot_argn("ufsrootsize", &root_size, sizeof(root_size));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 	uint32_t cache = 0, wait = 0;
+@@ -632,6 +678,9 @@
+ 	}
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
++		if (!error && (root_off || root_size)) {
++			error = ufs_apply_window(root_off, root_size);
++		}
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
