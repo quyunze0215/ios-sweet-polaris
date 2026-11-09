@@ -1,0 +1,61 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -395,6 +395,37 @@
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
+ }
++/*
++ * POLARIS dual-boot: the shim lives in the recovery partition, so Android's
++ * "reboot recovery" makes ABL boot iOS.  ABL reads the bootloader control
++ * block from `misc` and the booted system is expected to clear it -- iOS does
++ * not, so without this every later boot would come back to iOS.  Zero the
++ * first block (the BCB) and restore the root window afterwards.
++ */
++static int
++ufs_clear_misc_bcb(void)
++{
++	uint64_t save_first = su.first_block, save_nblocks = su.nblocks;
++	bool save_rw = su.writable;
++	int error = ufs_find_partition("misc");
++	if (error) {
++		su.first_block = save_first;
++		su.nblocks = save_nblocks;
++		printf("SWEET UFS: no misc partition (BCB not cleared)\n");
++		return error;
++	}
++	memset((void *)(su.dma + DMA_BOUNCE), 0, UFS_BLOCK);
++	su.writable = true;                      /* this one write is intentional */
++	error = ufs_write_blocks(su.first_block, 1);
++	su.writable = save_rw;
++	su.first_block = save_first;
++	su.nblocks = save_nblocks;
++	printf("SWEET UFS: misc BCB %s; a plain reboot returns to Android\n",
++	    error ? "clear FAILED" : "cleared");
++	return error;
++}
++
++
+ 
+ static int
+ ufs_take_over_host(void)
+@@ -646,6 +677,9 @@
+ 	uint64_t root_off = 0, root_size = 0;
+ 	PE_parse_boot_argn("ufsrootoff", &root_off, sizeof(root_off));
+ 	PE_parse_boot_argn("ufsrootsize", &root_size, sizeof(root_size));
++	/* POLARIS dual-boot: clear the misc BCB (see below). */
++	int clear_misc = 0;
++	PE_parse_boot_argn("clearmisc", &clear_misc, sizeof(clear_misc));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 	uint32_t cache = 0, wait = 0;
+@@ -680,6 +714,10 @@
+ 		error = ufs_find_partition(want);
+ 		if (!error && (root_off || root_size)) {
+ 			error = ufs_apply_window(root_off, root_size);
++		if (!error && clear_misc) {
++			/* Not fatal: the root still mounts if misc is odd. */
++			(void)ufs_clear_misc_bcb();
++		}
+ 		}
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);

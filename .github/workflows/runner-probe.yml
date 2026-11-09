@@ -1,0 +1,38 @@
+name: runner-probe
+
+# Which macOS runner labels still exist, and which Xcode does each ship?
+#
+# The xnu build needs Xcode 15.x (its iig matches the xnu-8796 IORPC ABI), and
+# macos-14 -- the image that used to provide it -- is now rejected by GitHub:
+#   "The configuration 'macos-14-arm64-us-default' is not supported"
+#
+# Dispatch this workflow and read the per-label jobs: the ones whose label no
+# longer exists fail immediately with that same message, the others print
+# sw_vers, the architecture, every installed Xcode and its version, and whether
+# iig is present.  `continue-on-error` keeps the remaining legs running.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [macos-13, macos-14, macos-14-large, macos-15, macos-15-intel, macos-26, macos-latest]
+    runs-on: ${{ matrix.label }}
+    continue-on-error: true
+    steps:
+      - name: Report
+        run: |
+          echo "label: ${{ matrix.label }}"
+          sw_vers
+          uname -m
+          echo "--- Xcode ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "(none)"
+          for a in /Applications/Xcode*.app; do
+            echo "  $a -> $(/usr/bin/defaults read "$a/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)"
+          done
+          echo "--- selected ---"
+          xcode-select -p || true
+          xcrun --find iig || true

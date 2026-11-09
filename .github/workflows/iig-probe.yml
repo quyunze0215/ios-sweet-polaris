@@ -1,0 +1,83 @@
+name: iig-probe
+
+# What does THIS runner's iig actually generate from an .iig file?
+#
+# The xnu-8796 build needs an iig whose output matches its IORPC ABI.  macos-14
+# (Xcode 15.x) is retired and macos-15 only ships Xcode 16.x / 26.x, so we have
+# to know exactly what the newer iig emits before patching xnu.  This runs iig
+# on a few DriverKit .iig files with the same flags iokit/DriverKit/Makefile
+# uses and dumps the generated header/impl (plus any kernelContent / IORPC use).
+#
+# Dispatch this; it takes about two minutes and needs no secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: runner label to probe
+        default: macos-15
+      xcode:
+        description: Xcode to use (default = oldest installed)
+        default: ""
+
+jobs:
+  iig:
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 20
+    steps:
+      - name: Show image
+        run: |
+          sw_vers
+          uname -m
+          ls -d /Applications/Xcode*.app || true
+
+      - name: Get xnu-8796
+        run: |
+          curl -sL -o /tmp/xnu.tgz \
+            https://codeload.github.com/apple-oss-distributions/xnu/tar.gz/refs/tags/xnu-8796.101.5
+          mkdir -p /tmp/xnu
+          tar xzf /tmp/xnu.tgz -C /tmp/xnu --strip-components=1
+          ls /tmp/xnu/iokit/DriverKit/*.iig | head -5
+
+      - name: Run iig on DriverKit defs
+        run: |
+          set -x
+          XC='${{ inputs.xcode }}'
+          if [ -z "$XC" ]; then
+            XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | head -1)
+          fi
+          if [ -z "$XC" ]; then
+            XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          fi
+          echo "using $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          IIG=$(xcrun --sdk macosx -find iig)
+          echo "iig: $IIG"
+          cd /tmp/xnu/iokit/DriverKit
+          for f in IOService.iig IOMemoryDescriptor.iig IODMACommand.iig IOEventLink.iig; do
+            OUT=$(mktemp -d)
+            base=${f%.iig}
+            echo "########## $f ##########"
+            "$IIG" --def "$f" --header "$OUT/$base.h" --impl "$OUT/$base.iig.cpp" \
+              --framework-name DriverKit \
+              -I/tmp/xnu/iokit -I/tmp/xnu/osfmk -I/tmp/xnu/bsd \
+              -- -isysroot "$SDK" -x c++ -std=gnu++1z -D__IIG=1 -DDRIVERKIT_PRIVATE=1 \
+                 -DPRIVATE_WIFI_ONLY=1 || echo "iig EXIT=$? on $f"
+            ls -la "$OUT" || true
+            echo "--- generated header: includes and IORPC use ---"
+            grep -n 'include\|IORPC\|kernelContent\|message' "$OUT/$base.h" 2>/dev/null | head -30 || true
+            echo "--- generated impl: first 60 lines ---"
+            head -60 "$OUT/$base.iig.cpp" 2>/dev/null || echo "(no impl)"
+            echo "--- generated impl: kernelContent / rpc. / IORPCMessageFromMach ---"
+            grep -n 'kernelContent\|rpc\.\|IORPCMessageFromMach\|Invoke(' "$OUT/$base.iig.cpp" 2>/dev/null | head -40 || true
+          done
+
+      - name: xnu's own IORPC, for comparison
+        run: |
+          echo "--- /tmp/xnu/iokit/DriverKit/IORPC.h struct IORPC ---"
+          sed -n '180,240p' /tmp/xnu/iokit/DriverKit/IORPC.h
+          echo "--- where the kernel uses kernelContent / IORPCMessageFromMach ---"
+          grep -rn 'kernelContent' /tmp/xnu/iokit | head -20 || echo "(kernelContent: none in iokit)"
+          grep -rn 'IORPCMessageFromMach' /tmp/xnu/iokit/Kernel/IOUserServer.cpp | head -20 || true
